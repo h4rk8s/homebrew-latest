@@ -1,0 +1,49 @@
+#!/bin/bash
+# Refresh cask versions to track latest releases
+# Runs standalone or via launchd
+set -euo pipefail
+
+TAP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+CASKS_DIR="$TAP_DIR/Casks"
+CHANGED=0
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+update_cask() {
+  local cask_file="$1" current_ver="$2" latest_ver="$3" name="$4"
+  if [[ "$current_ver" == "$latest_ver" ]]; then
+    log "$name: already at $current_ver"
+    return
+  fi
+  log "$name: $current_ver -> $latest_ver"
+  sed -i '' "s/version \"$current_ver\"/version \"$latest_ver\"/" "$cask_file"
+  CHANGED=1
+}
+
+# --- Claude Code: npm @anthropic-ai/claude-code latest tag ---
+claude_cask="$CASKS_DIR/claude-code.rb"
+claude_current=$(grep -oE 'version "[^"]+"' "$claude_cask" | head -1 | tr -d 'version "')
+claude_latest=$(npm view @anthropic-ai/claude-code dist-tags.latest 2>/dev/null || echo "$claude_current")
+update_cask "$claude_cask" "$claude_current" "$claude_latest" "claude-code"
+
+# --- Codex: GitHub releases latest (rust-v* tags) ---
+codex_cask="$CASKS_DIR/codex.rb"
+codex_current=$(grep -oE 'version "[^"]+"' "$codex_cask" | head -1 | tr -d 'version "')
+codex_latest=$(gh release view --repo openai/codex --json tagName -q '.tagName' 2>/dev/null | sed 's/^rust-v//' || echo "$codex_current")
+update_cask "$codex_cask" "$codex_current" "$codex_latest" "codex"
+
+# --- Commit & push if changed ---
+if [[ "$CHANGED" -eq 1 ]]; then
+  cd "$TAP_DIR"
+  git add Casks/
+  git commit -m "bump: claude-code=$claude_latest codex=$codex_latest"
+  git push origin main
+  log "pushed to remote"
+
+  # Upgrade locally installed casks
+  brew upgrade --cask h4rk8s/latest/claude-code 2>/dev/null || true
+  brew upgrade --cask h4rk8s/latest/codex 2>/dev/null || true
+  log "brew upgrade done"
+else
+  log "no updates"
+fi

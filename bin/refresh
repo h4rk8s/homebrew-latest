@@ -3,7 +3,25 @@
 # Runs standalone or via launchd
 set -euo pipefail
 
-TAP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+resolve_tap_dir() {
+  if [[ -n "${HOMEBREW_LATEST_TAP_DIR:-}" && -d "${HOMEBREW_LATEST_TAP_DIR}" ]]; then
+    echo "${HOMEBREW_LATEST_TAP_DIR}"
+    return
+  fi
+
+  if command -v brew >/dev/null 2>&1; then
+    local repo
+    repo="$(brew --repository h4rk8s/latest 2>/dev/null || true)"
+    if [[ -n "${repo}" && -d "${repo}" ]]; then
+      echo "${repo}"
+      return
+    fi
+  fi
+
+  cd "$(dirname "$0")/.." && pwd
+}
+
+TAP_DIR="$(resolve_tap_dir)"
 CASKS_DIR="$TAP_DIR/Casks"
 CHANGED=0
 

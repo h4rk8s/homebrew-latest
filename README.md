@@ -17,14 +17,30 @@ brew install h4rk8s/latest/claude-code
 brew install h4rk8s/latest/codex
 ```
 
-## Auto-refresh (launchd)
+## Auto-refresh (brew services, preferred)
+
+```bash
+brew install h4rk8s/latest/homebrew-latest-refresh
+brew services start h4rk8s/latest/homebrew-latest-refresh
+```
+
+Shows up in `brew services ls`, runs daily, checks for new versions, updates cask files, pushes to GitHub, and runs `brew upgrade`.
+
+Stop it with:
+
+```bash
+brew services stop h4rk8s/latest/homebrew-latest-refresh
+```
+
+## Auto-refresh (legacy launchd plist)
 
 ```bash
 cp dev.h4rk8s.homebrew-latest-refresh.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/dev.h4rk8s.homebrew-latest-refresh.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.h4rk8s.homebrew-latest-refresh.plist
+launchctl kickstart -k gui/$(id -u)/dev.h4rk8s.homebrew-latest-refresh
 ```
 
-Runs daily. Checks for new versions, updates cask files, pushes to GitHub, and runs `brew upgrade`.
+Do not run the legacy plist and the `brew services` service at the same time.
 
 ## Manual refresh
 

@@ -1,5 +1,5 @@
 cask "claude-code" do
-  version "2.1.90"
+  version "2.1.91"
 
   on_arm do
     url "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/#{version}/darwin-arm64/claude",

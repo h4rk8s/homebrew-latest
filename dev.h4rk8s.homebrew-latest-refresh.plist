@@ -32,6 +32,6 @@
 	<key>StandardOutPath</key>
 	<string>/Users/jawa/Library/Logs/homebrew-latest-refresh.log</string>
 	<key>StartInterval</key>
-	<integer>21600</integer>
+	<integer>86400</integer>
 </dict>
 </plist>

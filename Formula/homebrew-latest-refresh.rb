@@ -15,7 +15,7 @@ class HomebrewLatestRefresh < Formula
     run [tap_root/"bin/refresh"]
     working_dir tap_root
     run_type :interval
-    interval 86400
+    interval 21600
     environment_variables PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
                           HOMEBREW_LATEST_TAP_DIR: tap_root.to_s,
                           HTTP_PROXY: "http://127.0.0.1:6152",

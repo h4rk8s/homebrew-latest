@@ -16,6 +16,4 @@ cask "codex" do
   name "Codex"
   desc "OpenAI's coding agent (latest channel)"
   homepage "https://github.com/openai/codex"
-
-  conflicts_with cask: "homebrew/cask/codex"
 end

@@ -17,8 +17,6 @@ cask "claude-code" do
   desc "Terminal-based AI coding assistant (latest channel)"
   homepage "https://www.anthropic.com/claude-code"
 
-  conflicts_with cask: "homebrew/cask/claude-code"
-
   binary "claude"
 
   zap trash: [

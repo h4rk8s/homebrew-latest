@@ -21,6 +21,14 @@ resolve_tap_dir() {
   cd "$(dirname "$0")/.." && pwd
 }
 
+UPGRADE=0
+for arg in "$@"; do
+  case "$arg" in
+    --upgrade) UPGRADE=1 ;;
+    *) echo "unknown arg: $arg" >&2; exit 1 ;;
+  esac
+done
+
 TAP_DIR="$(resolve_tap_dir)"
 CASKS_DIR="$TAP_DIR/Casks"
 CHANGED=0
@@ -58,10 +66,13 @@ if [[ "$CHANGED" -eq 1 ]]; then
   git push origin main
   log "pushed to remote"
 
-  # Upgrade locally installed casks
-  brew upgrade --cask h4rk8s/latest/claude-code 2>/dev/null || true
-  brew upgrade --cask h4rk8s/latest/codex 2>/dev/null || true
-  log "brew upgrade done"
+  if [[ "$UPGRADE" -eq 1 ]]; then
+    brew upgrade --cask h4rk8s/latest/claude-code 2>/dev/null || true
+    brew upgrade --cask h4rk8s/latest/codex 2>/dev/null || true
+    log "brew upgrade done"
+  else
+    log "skipped local upgrade (pass --upgrade to opt in)"
+  fi
 else
   log "no updates"
 fi

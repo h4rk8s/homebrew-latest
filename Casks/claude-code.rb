@@ -19,6 +19,12 @@ cask "claude-code" do
 
   binary "claude"
 
+  postflight do
+    system_command "/usr/bin/xattr",
+                   args: ["-dr", "com.apple.quarantine", staged_path.to_s],
+                   sudo: false
+  end
+
   zap trash: [
     "~/.cache/claude",
     "~/.claude.json*",

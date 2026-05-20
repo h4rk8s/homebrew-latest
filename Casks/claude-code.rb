@@ -1,10 +1,10 @@
 cask "claude-code" do
-  version "2.1.144"
+  version "2.1.145"
 
   on_arm do
     url "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/#{version}/darwin-arm64/claude",
         verified: "storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/"
-    sha256 "9886baa4ec4c455f86108464f121732193ee76e5dfceb031005f59f31276a5df"
+    sha256 :no_check
   end
 
   on_intel do

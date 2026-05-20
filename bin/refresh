@@ -36,13 +36,29 @@ CHANGED=0
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
 update_cask() {
-  local cask_file="$1" current_ver="$2" latest_ver="$3" name="$4"
+  local cask_file="$1" current_ver="$2" latest_ver="$3" name="$4" arm_url_tpl="$5"
   if [[ "$current_ver" == "$latest_ver" ]]; then
     log "$name: already at $current_ver"
     return
   fi
   log "$name: $current_ver -> $latest_ver"
   sed -i '' "s/version \"$current_ver\"/version \"$latest_ver\"/" "$cask_file"
+
+  # arm64 sha256：当前机器 arch（用户偏好），临时文件用完即删
+  local arm_url="${arm_url_tpl//__VERSION__/$latest_ver}"
+  local tmp
+  tmp=$(mktemp -t casksha)
+  if curl -fsSL "$arm_url" -o "$tmp"; then
+    local sha
+    sha=$(shasum -a 256 "$tmp" | awk '{print $1}')
+    # 只在 on_arm 块内替换 sha256（兼容 :no_check 和已有 hash 两种情形）
+    sed -i '' -E "/on_arm do/,/^  end/ s|sha256 (:no_check|\"[a-f0-9]+\")|sha256 \"$sha\"|" "$cask_file"
+    log "$name: arm64 sha256 = $sha"
+  else
+    log "$name: WARN curl failed for $arm_url, arm sha256 not updated"
+  fi
+  /bin/rm -f "$tmp"
+
   CHANGED=1
 }
 
@@ -50,13 +66,15 @@ update_cask() {
 claude_cask="$CASKS_DIR/claude-code.rb"
 claude_current=$(grep -oE 'version "[^"]+"' "$claude_cask" | head -1 | tr -d 'version "')
 claude_latest=$(npm view @anthropic-ai/claude-code dist-tags.latest 2>/dev/null || echo "$claude_current")
-update_cask "$claude_cask" "$claude_current" "$claude_latest" "claude-code"
+update_cask "$claude_cask" "$claude_current" "$claude_latest" "claude-code" \
+  "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/__VERSION__/darwin-arm64/claude"
 
 # --- Codex: GitHub releases latest (rust-v* tags) ---
 codex_cask="$CASKS_DIR/codex.rb"
 codex_current=$(grep -oE 'version "[^"]+"' "$codex_cask" | head -1 | tr -d 'version "')
 codex_latest=$(gh release view --repo openai/codex --json tagName -q '.tagName' 2>/dev/null | sed 's/^rust-v//' || echo "$codex_current")
-update_cask "$codex_cask" "$codex_current" "$codex_latest" "codex"
+update_cask "$codex_cask" "$codex_current" "$codex_latest" "codex" \
+  "https://github.com/openai/codex/releases/download/rust-v__VERSION__/codex-aarch64-apple-darwin.tar.gz"
 
 # --- Commit & push if changed ---
 if [[ "$CHANGED" -eq 1 ]]; then

@@ -3,7 +3,7 @@ cask "codex" do
 
   on_arm do
     url "https://github.com/openai/codex/releases/download/rust-v#{version}/codex-aarch64-apple-darwin.tar.gz"
-    sha256 :no_check
+    sha256 "5997e22af1a05ec303be6e06a9f8cd950da38da4b909b6819747f1782e66825c"
     binary "codex-aarch64-apple-darwin", target: "codex"
   end
 

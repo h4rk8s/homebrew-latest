@@ -16,11 +16,11 @@ class HomebrewLatestRefresh < Formula
     working_dir tap_root
     run_type :interval
     interval 21600
-    environment_variables PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+    environment_variables PATH:                    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
                           HOMEBREW_LATEST_TAP_DIR: tap_root.to_s,
-                          HTTP_PROXY: "http://127.0.0.1:6152",
-                          HTTPS_PROXY: "http://127.0.0.1:6152"
-    log_path Pathname.new(ENV["HOME"])/"Library/Logs/homebrew-latest-refresh.log"
-    error_log_path Pathname.new(ENV["HOME"])/"Library/Logs/homebrew-latest-refresh.err.log"
+                          HTTP_PROXY:              "http://127.0.0.1:6152",
+                          HTTPS_PROXY:             "http://127.0.0.1:6152"
+    log_path Pathname.new(Dir.home)/"Library/Logs/homebrew-latest-refresh.log"
+    error_log_path Pathname.new(Dir.home)/"Library/Logs/homebrew-latest-refresh.err.log"
   end
 end

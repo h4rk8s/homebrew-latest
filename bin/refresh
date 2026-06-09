@@ -35,6 +35,49 @@ CHANGED=0
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
+# 清理 stale .git/index.lock（mtime > 30s 一律视为崩溃残留）
+clear_stale_git_lock() {
+  local repo="$1"
+  local lock="$repo/.git/index.lock"
+  [[ -f "$lock" ]] || return 0
+  local now age
+  now=$(date +%s)
+  age=$(( now - $(stat -f %m "$lock") ))
+  if (( age < 30 )); then
+    log "git lock 还新 (${age}s)，跳过清理"
+    return 0
+  fi
+  rm -f "$lock"
+  log "已清理 stale git lock (年龄 ${age}s)"
+}
+
+# git 命令带 retry，识别 transient 错误自动重试
+git_with_retry() {
+  local max=3 delay=5 attempt=1 output rc
+  while (( attempt <= max )); do
+    if output=$(git "$@" 2>&1); then
+      [[ -n "$output" ]] && echo "$output"
+      return 0
+    fi
+    rc=$?
+    if (( attempt == max )); then
+      echo "$output" >&2
+      return $rc
+    fi
+    if echo "$output" | grep -qE "Could not resolve hostname|Connection timed out|Host key verification failed|index\.lock|Connection refused|Connection reset"; then
+      log "git $1 第 ${attempt} 次失败 ($(echo "$output" | head -1 | head -c 80))，${delay}s 后重试"
+      if echo "$output" | grep -q "index.lock"; then
+        clear_stale_git_lock "$(pwd)"
+      fi
+      sleep "$delay"
+      (( attempt++ ))
+    else
+      echo "$output" >&2
+      return $rc
+    fi
+  done
+}
+
 update_cask() {
   local cask_file="$1" current_ver="$2" latest_ver="$3" name="$4"
   if [[ "$current_ver" == "$latest_ver" ]]; then
@@ -63,9 +106,10 @@ update_cask "$codex_cask" "$codex_current" "$codex_latest" "codex"
 # --- Commit & push if changed ---
 if [[ "$CHANGED" -eq 1 ]]; then
   cd "$TAP_DIR"
+  clear_stale_git_lock "$TAP_DIR"
   git add Casks/
   git commit -m "bump: claude-code=$claude_latest codex=$codex_latest"
-  git push origin main
+  git_with_retry push origin main
   log "pushed to remote"
 
   if [[ "$UPGRADE" -eq 1 ]]; then

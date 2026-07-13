@@ -1,5 +1,5 @@
 cask "codex" do
-  version "0.144.1"
+  version "0.144.2"
 
   on_arm do
     url "https://github.com/openai/codex/releases/download/rust-v#{version}/codex-aarch64-apple-darwin.tar.gz"

@@ -2,15 +2,20 @@ cask "codex" do
   version "0.147.0"
 
   on_arm do
-    url "https://github.com/openai/codex/releases/download/rust-v#{version}/codex-aarch64-apple-darwin.tar.gz"
-    sha256 :no_check
-    binary "codex-aarch64-apple-darwin", target: "codex"
-  end
+    sha256 "17b2984eb22b607e3d0c25728252fc90f510e476bad39a6d9f45cdb1aa685432"
 
+    url "https://github.com/openai/codex/releases/download/rust-v#{version}/codex-package-aarch64-apple-darwin.tar.gz"
+
+    binary "bin/codex"
+    binary "bin/codex-code-mode-host"
+  end
   on_intel do
-    url "https://github.com/openai/codex/releases/download/rust-v#{version}/codex-x86_64-apple-darwin.tar.gz"
-    sha256 :no_check
-    binary "codex-x86_64-apple-darwin", target: "codex"
+    sha256 "d91e59133daf923bc45d76e3da4af8ae9ef62a0231da18488da0cd573b6e9d63"
+
+    url "https://github.com/openai/codex/releases/download/rust-v#{version}/codex-package-x86_64-apple-darwin.tar.gz"
+
+    binary "bin/codex"
+    binary "bin/codex-code-mode-host"
   end
 
   name "Codex"
@@ -28,6 +33,7 @@ cask "codex" do
     version_dir = standalone_dir/"brew-#{version}"
     version_dir.mkpath
     FileUtils.ln_sf "/opt/homebrew/bin/codex", version_dir/"codex"
+    FileUtils.ln_sf "/opt/homebrew/bin/codex-code-mode-host", version_dir/"codex-code-mode-host"
     current_link = standalone_dir/"current"
     current_link.delete if current_link.symlink? || current_link.exist?
     File.symlink(version_dir.basename.to_s, current_link)

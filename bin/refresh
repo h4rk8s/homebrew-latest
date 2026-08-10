@@ -289,8 +289,11 @@ validate_codex_cask_contract() {
   require_one_match -Fxc '  depends_on :macos' "$CODEX_CASK" || return 1
   require_one_match -Ec '^[[:space:]]*sha256[[:space:]]' "$CODEX_CASK" || return 1
   require_one_match -Fxc "$expected_url" "$CODEX_CASK" || return 1
-  require_one_match -Ec '^[[:space:]]*binary "bin/codex"$' "$CODEX_CASK" || return 1
+  require_one_match -Fxc '  binary "bin/codex-homebrew", target: "codex"' "$CODEX_CASK" || return 1
   require_one_match -Ec '^[[:space:]]*binary "bin/codex-code-mode-host"$' "$CODEX_CASK" || return 1
+  require_one_match -Fxc \
+    '  generate_completions_from_executable "bin/codex-homebrew", "completion", base_name: "codex"' \
+    "$CODEX_CASK" || return 1
   if grep -qE 'arm64_linux:|x86_64_linux:' "$CODEX_CASK"; then
     return 1
   else

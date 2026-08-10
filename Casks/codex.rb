@@ -18,19 +18,27 @@ cask "codex" do
 
   depends_on :macos
 
-  binary "bin/codex"
+  binary "bin/codex-homebrew", target: "codex"
   # Keep the host public for callers that launch it via HOMEBREW_PREFIX/bin.
   binary "bin/codex-code-mode-host"
+  generate_completions_from_executable "bin/codex-homebrew", "completion", base_name: "codex"
+
+  preflight do
+    system_command "/usr/bin/xattr",
+                   args: ["-dr", "com.apple.quarantine", staged_path.to_s],
+                   sudo: false
+
+    # Preserve the canonical package entrypoint while avoiding stale macOS
+    # execution assessments tied to that exact path. A hard link costs no
+    # additional package space and remains inside the signed package layout.
+    FileUtils.ln staged_path/"bin/codex", staged_path/"bin/codex-homebrew"
+  end
 
   postflight do
     standalone_dir = Pathname("~/.codex/packages/standalone").expand_path
     if standalone_dir.symlink? || (standalone_dir.exist? && !standalone_dir.directory?)
       raise "#{standalone_dir} exists and is not a managed directory"
     end
-
-    system_command "/usr/bin/xattr",
-                   args: ["-dr", "com.apple.quarantine", staged_path.to_s],
-                   sudo: false
 
     standalone_dir.mkpath
 

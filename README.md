@@ -24,7 +24,9 @@ brew install h4rk8s/latest/homebrew-latest-refresh
 brew services start h4rk8s/latest/homebrew-latest-refresh
 ```
 
-Shows up in `brew services ls`, runs daily, checks for new versions, updates cask files, pushes to GitHub, and runs `brew upgrade`.
+Shows up in `brew services ls`, checks for new versions on its configured
+interval, validates Codex package assets and checksums, updates cask files, and
+pushes to GitHub. Local upgrades remain opt-in with `--upgrade`.
 
 Stop it with:
 
@@ -45,5 +47,13 @@ Do not run the legacy plist and the `brew services` service at the same time.
 ## Manual refresh
 
 ```bash
+$(brew --repo h4rk8s/latest)/bin/refresh --check
 $(brew --repo h4rk8s/latest)/bin/refresh
+$(brew --repo h4rk8s/latest)/bin/refresh --upgrade
 ```
+
+`--check` is read-only. It verifies that the cask matches the latest stable
+release and validates both macOS Codex packages, including their layouts,
+checksums, architectures, OpenAI signatures, and helper binaries. Native
+executables are also smoke-tested, without committing, pushing, or upgrading
+anything.

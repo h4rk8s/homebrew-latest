@@ -1,124 +1,691 @@
 #!/bin/bash
-# Refresh cask versions to track latest releases
-# Runs standalone or via launchd
+# Refresh cask versions to track latest releases.
 set -euo pipefail
 
 resolve_tap_dir() {
+  local script_repo
   if [[ -n "${HOMEBREW_LATEST_TAP_DIR:-}" && -d "${HOMEBREW_LATEST_TAP_DIR}" ]]; then
-    echo "${HOMEBREW_LATEST_TAP_DIR}"
+    printf '%s\n' "${HOMEBREW_LATEST_TAP_DIR}"
+    return
+  fi
+
+  script_repo="$(cd "$(dirname "$0")/.." && pwd)"
+  if [[ -e "$script_repo/.git" && -d "$script_repo/Casks" ]]; then
+    printf '%s\n' "$script_repo"
     return
   fi
 
   if command -v brew >/dev/null 2>&1; then
     local repo
     repo="$(brew --repository h4rk8s/latest 2>/dev/null || true)"
-    if [[ -n "${repo}" && -d "${repo}" ]]; then
-      echo "${repo}"
+    if [[ -n "$repo" && -d "$repo" ]]; then
+      printf '%s\n' "$repo"
       return
     fi
   fi
 
-  cd "$(dirname "$0")/.." && pwd
+  printf '%s\n' "$script_repo"
 }
 
 UPGRADE=0
+CHECK_ONLY=0
 for arg in "$@"; do
   case "$arg" in
+    --check) CHECK_ONLY=1 ;;
     --upgrade) UPGRADE=1 ;;
-    *) echo "unknown arg: $arg" >&2; exit 1 ;;
+    *) printf 'unknown arg: %s\n' "$arg" >&2; exit 1 ;;
   esac
 done
 
+if (( CHECK_ONLY && UPGRADE )); then
+  echo "--check and --upgrade cannot be used together" >&2
+  exit 1
+fi
+
 TAP_DIR="$(resolve_tap_dir)"
 CASKS_DIR="$TAP_DIR/Casks"
-CHANGED=0
+CLAUDE_CASK="$CASKS_DIR/claude-code.rb"
+CODEX_CASK="$CASKS_DIR/codex.rb"
+CLAUDE_CHANGED=0
+CODEX_CHANGED=0
+LOOKUP_FAILED=0
+CODEX_CONTRACT_VALID=0
+RESTORE_PENDING=0
+CLAUDE_BACKUP=""
+CODEX_BACKUP=""
+CLAUDE_CANDIDATE=""
+CODEX_CANDIDATE=""
+TEMP_ROOT=""
+LOCK_DIR=""
+LOCK_ACQUIRED=0
+LOCK_PID_FILE=""
+FILES_STAGED=0
+PRE_COMMIT_HEAD=""
+CODEX_CURRENT="unknown"
+CODEX_CURRENT_ARM_SHA=""
+CODEX_CURRENT_INTEL_SHA=""
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
-# 清理 stale .git/index.lock（mtime > 30s 一律视为崩溃残留）
-clear_stale_git_lock() {
-  local repo="$1"
-  local lock="$repo/.git/index.lock"
-  [[ -f "$lock" ]] || return 0
-  local now age
-  now=$(date +%s)
-  age=$(( now - $(stat -f %m "$lock") ))
-  if (( age < 30 )); then
-    log "git lock 还新 (${age}s)，跳过清理"
-    return 0
+cleanup() {
+  local status=$? cleanup_failed=0 restore_failed=0 head_changed=0 current_head=""
+  trap - EXIT
+  set +e
+
+  if (( RESTORE_PENDING )) && [[ -n "$PRE_COMMIT_HEAD" ]]; then
+    current_head="$(git -C "$TAP_DIR" rev-parse HEAD 2>/dev/null)"
+    [[ -z "$current_head" || "$current_head" == "$PRE_COMMIT_HEAD" ]] || head_changed=1
   fi
-  rm -f "$lock"
-  log "已清理 stale git lock (年龄 ${age}s)"
+
+  if (( RESTORE_PENDING && ! head_changed )); then
+    if (( FILES_STAGED )); then
+      git -C "$TAP_DIR" restore --staged -- Casks/claude-code.rb Casks/codex.rb || cleanup_failed=1
+    fi
+    if [[ -n "$CLAUDE_BACKUP" && -f "$CLAUDE_BACKUP" ]]; then
+      if /bin/mv -f "$CLAUDE_BACKUP" "$CLAUDE_CASK"; then
+        CLAUDE_BACKUP=""
+      else
+        restore_failed=1
+      fi
+    fi
+    if [[ -n "$CODEX_BACKUP" && -f "$CODEX_BACKUP" ]]; then
+      if /bin/mv -f "$CODEX_BACKUP" "$CODEX_CASK"; then
+        CODEX_BACKUP=""
+      else
+        restore_failed=1
+      fi
+    fi
+  elif (( RESTORE_PENDING && head_changed )); then
+    log "commit completed before interruption; preserving committed cask files"
+  fi
+
+  [[ -z "$CLAUDE_CANDIDATE" || ! -f "$CLAUDE_CANDIDATE" ]] || /bin/rm -f "$CLAUDE_CANDIDATE"
+  [[ -z "$CODEX_CANDIDATE" || ! -f "$CODEX_CANDIDATE" ]] || /bin/rm -f "$CODEX_CANDIDATE"
+  if (( ! restore_failed )); then
+    [[ -z "$CLAUDE_BACKUP" || ! -f "$CLAUDE_BACKUP" ]] || /bin/rm -f "$CLAUDE_BACKUP"
+    [[ -z "$CODEX_BACKUP" || ! -f "$CODEX_BACKUP" ]] || /bin/rm -f "$CODEX_BACKUP"
+  else
+    log "failed to restore a cask backup; preserved the backup in $CASKS_DIR"
+    cleanup_failed=1
+  fi
+
+  if [[ -n "$TEMP_ROOT" && -d "$TEMP_ROOT" ]]; then
+    case "$(basename "$TEMP_ROOT")" in
+      homebrew-latest-refresh.*) /bin/rm -rf "$TEMP_ROOT" || cleanup_failed=1 ;;
+    esac
+  fi
+  if (( LOCK_ACQUIRED )) && [[ -n "$LOCK_DIR" && -d "$LOCK_DIR" ]]; then
+    [[ -z "$LOCK_PID_FILE" || ! -f "$LOCK_PID_FILE" ]] || /bin/rm -f "$LOCK_PID_FILE"
+    /bin/rmdir "$LOCK_DIR" 2>/dev/null || cleanup_failed=1
+  fi
+
+  (( status != 0 || cleanup_failed == 0 )) || status=1
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+acquire_lock() {
+  local common_dir age owner_pid="" reclaim=0
+  common_dir="$(git -C "$TAP_DIR" rev-parse --git-common-dir)"
+  if [[ "$common_dir" != /* ]]; then
+    common_dir="$TAP_DIR/$common_dir"
+  fi
+  LOCK_DIR="$common_dir/homebrew-latest-refresh.lock"
+  LOCK_PID_FILE="$LOCK_DIR/pid"
+
+  if /bin/mkdir "$LOCK_DIR" 2>/dev/null; then
+    LOCK_ACQUIRED=1
+    printf '%s\n' "$$" > "$LOCK_PID_FILE"
+    return
+  fi
+
+  if [[ -f "$LOCK_PID_FILE" ]]; then
+    owner_pid="$(sed -nE 's/^([0-9]+)$/\1/p' "$LOCK_PID_FILE")"
+  fi
+  if [[ -n "$owner_pid" ]] && kill -0 "$owner_pid" 2>/dev/null; then
+    log "another refresh is active (pid $owner_pid); skipping"
+    exit 0
+  elif [[ -n "$owner_pid" ]]; then
+    reclaim=1
+  fi
+
+  age=$(( $(date +%s) - $(stat -f %m "$LOCK_DIR") ))
+  (( age <= 21600 )) || reclaim=1
+  if (( reclaim )); then
+    [[ ! -f "$LOCK_PID_FILE" ]] || /bin/rm -f "$LOCK_PID_FILE" 2>/dev/null || true
+  fi
+  if (( reclaim )) && /bin/rmdir "$LOCK_DIR" 2>/dev/null && /bin/mkdir "$LOCK_DIR" 2>/dev/null; then
+    LOCK_ACQUIRED=1
+    printf '%s\n' "$$" > "$LOCK_PID_FILE"
+    log "recovered stale refresh lock (${age}s old)"
+    return
+  fi
+
+  log "another refresh is active; skipping"
+  exit 0
 }
 
-# git 命令带 retry，识别 transient 错误自动重试
 git_with_retry() {
   local max=3 delay=5 attempt=1 output rc
   while (( attempt <= max )); do
-    if output=$(git "$@" 2>&1); then
-      [[ -n "$output" ]] && echo "$output"
-      return 0
+    if output="$(git "$@" 2>&1)"; then
+      [[ -z "$output" ]] || echo "$output"
+      return
     fi
     rc=$?
     if (( attempt == max )); then
       echo "$output" >&2
-      return $rc
+      return "$rc"
     fi
-    if echo "$output" | grep -qE "Could not resolve hostname|Connection timed out|Host key verification failed|index\.lock|Connection refused|Connection reset"; then
-      log "git $1 第 ${attempt} 次失败 ($(echo "$output" | head -1 | head -c 80))，${delay}s 后重试"
-      if echo "$output" | grep -q "index.lock"; then
-        clear_stale_git_lock "$(pwd)"
-      fi
+    if grep -qE "Could not resolve hostname|Connection timed out|Connection refused|Connection reset" \
+      <<< "$output"; then
+      log "git $1 failed on attempt $attempt; retrying in ${delay}s"
       sleep "$delay"
       (( attempt++ ))
     else
       echo "$output" >&2
-      return $rc
+      return "$rc"
     fi
   done
 }
 
-update_cask() {
-  local cask_file="$1" current_ver="$2" latest_ver="$3" name="$4"
-  if [[ "$current_ver" == "$latest_ver" ]]; then
-    log "$name: already at $current_ver"
-    return
+require_clean_main() {
+  local branch status ahead
+  branch="$(git -C "$TAP_DIR" branch --show-current)"
+  [[ "$branch" == "main" ]] || {
+    log "refusing to publish from branch '$branch'"
+    return 1
+  }
+
+  status="$(git -C "$TAP_DIR" status --porcelain --untracked-files=normal)"
+  [[ -z "$status" ]] || {
+    log "refusing to refresh a dirty tap worktree"
+    echo "$status" >&2
+    return 1
+  }
+
+  (
+    cd "$TAP_DIR"
+    git_with_retry pull --ff-only origin main
+  )
+
+  ahead="$(git -C "$TAP_DIR" rev-list --count origin/main..HEAD)"
+  if (( ahead > 0 )); then
+    log "publishing $ahead pending local commit(s)"
+    (
+      cd "$TAP_DIR"
+      git_with_retry push origin main
+    )
   fi
-  log "$name: $current_ver -> $latest_ver"
-  sed -i '' "s/version \"$current_ver\"/version \"$latest_ver\"/" "$cask_file"
-  # 不再算 sha256：上游 release 时序 / refresh race condition 导致 sha 跟不上版本，
-  # 用户被卡在 install 失败。cask 用 :no_check 让 brew 不要校验哈希。
-  CHANGED=1
 }
 
-# --- Claude Code: npm @anthropic-ai/claude-code latest tag ---
-claude_cask="$CASKS_DIR/claude-code.rb"
-claude_current=$(grep -oE 'version "[^"]+"' "$claude_cask" | head -1 | tr -d 'version "')
-claude_latest=$(npm view @anthropic-ai/claude-code dist-tags.latest 2>/dev/null || echo "$claude_current")
-update_cask "$claude_cask" "$claude_current" "$claude_latest" "claude-code"
+valid_digest() {
+  local hex
+  case "$1" in
+    sha256:*) hex="${1#sha256:}" ;;
+    *) return 1 ;;
+  esac
+  [[ ${#hex} -eq 64 && "$hex" != *[!0-9a-f]* ]]
+}
 
-# --- Codex: GitHub releases latest (rust-v* tags) ---
-codex_cask="$CASKS_DIR/codex.rb"
-codex_current=$(grep -oE 'version "[^"]+"' "$codex_cask" | head -1 | tr -d 'version "')
-codex_latest=$(gh release view --repo openai/codex --json tagName -q '.tagName' 2>/dev/null | sed 's/^rust-v//' || echo "$codex_current")
-update_cask "$codex_cask" "$codex_current" "$codex_latest" "codex"
+compare_versions() {
+  awk -v left="$1" -v right="$2" 'BEGIN {
+    left_count = split(left, left_parts, ".")
+    right_count = split(right, right_parts, ".")
+    count = left_count > right_count ? left_count : right_count
+    for (i = 1; i <= count; i++) {
+      left_value = left_parts[i] + 0
+      right_value = right_parts[i] + 0
+      if (left_value < right_value) { print -1; exit }
+      if (left_value > right_value) { print 1; exit }
+    }
+    print 0
+  }'
+}
 
-# --- Commit & push if changed ---
-if [[ "$CHANGED" -eq 1 ]]; then
+valid_version_order() {
+  case "$1" in
+    -1|0|1) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+require_one_match() {
+  local option="$1" pattern="$2" file="$3" count status
+  if count="$(grep "$option" "$pattern" "$file")"; then
+    status=0
+  else
+    status=$?
+  fi
+  (( status == 0 || status == 1 )) || return 1
+  [[ "$count" == "1" ]] || return 1
+}
+
+extract_unique() {
+  local expression="$1" file="$2" value
+  value="$(sed -nE "$expression" "$file")" || return 1
+  [[ -n "$value" && "$value" != *$'\n'* ]] || return 1
+  printf '%s\n' "$value"
+}
+
+read_codex_cask() {
+  CODEX_CURRENT="$(extract_unique 's/^[[:space:]]*version "([^"]+)".*/\1/p' "$CODEX_CASK")" || return
+  CODEX_CURRENT_ARM_SHA="$(
+    extract_unique 's/^[[:space:]]*sha256 arm:[[:space:]]*"([^"]+)".*/\1/p' "$CODEX_CASK"
+  )" || return
+  CODEX_CURRENT_INTEL_SHA="$(
+    extract_unique 's/^[[:space:]]*intel:[[:space:]]*"([^"]+)".*/\1/p' "$CODEX_CASK"
+  )" || return
+}
+
+validate_codex_cask_contract() {
+  local expected_url linux_status
+  expected_url='  url "https://github.com/openai/codex/releases/download/rust-v#{version}'\
+'/codex-package-#{arch}-apple-darwin.tar.gz"'
+  require_one_match -Fxc '  arch arm: "aarch64", intel: "x86_64"' "$CODEX_CASK" || return 1
+  require_one_match -Fxc '  depends_on :macos' "$CODEX_CASK" || return 1
+  require_one_match -Ec '^[[:space:]]*sha256[[:space:]]' "$CODEX_CASK" || return 1
+  require_one_match -Fxc "$expected_url" "$CODEX_CASK" || return 1
+  require_one_match -Ec '^[[:space:]]*binary "bin/codex"$' "$CODEX_CASK" || return 1
+  require_one_match -Ec '^[[:space:]]*binary "bin/codex-code-mode-host"$' "$CODEX_CASK" || return 1
+  if grep -qE 'arm64_linux:|x86_64_linux:' "$CODEX_CASK"; then
+    return 1
+  else
+    linux_status=$?
+    [[ "$linux_status" -eq 1 ]] || return 1
+  fi
+  read_codex_cask || return 1
+  printf '%s\n' "$CODEX_CURRENT" | grep -Eq '^[0-9]+([.][0-9]+)+$' || return 1
+  valid_digest "sha256:$CODEX_CURRENT_ARM_SHA" || return 1
+  valid_digest "sha256:$CODEX_CURRENT_INTEL_SHA" || return 1
+}
+
+fetch_codex_release() {
+  local row tag arm_digest intel_digest extra
+  row="$(gh api repos/openai/codex/releases/latest --jq '
+    select(.draft == false and .prerelease == false)
+    | . as $release
+    | ($release.assets | map(select(.name == "codex-package-aarch64-apple-darwin.tar.gz"))) as $arm
+    | ($release.assets | map(select(.name == "codex-package-x86_64-apple-darwin.tar.gz"))) as $intel
+    | select(($arm | length) == 1 and ($intel | length) == 1)
+    | select($arm[0].state == "uploaded" and $intel[0].state == "uploaded")
+    | select($arm[0].size > 0 and $intel[0].size > 0)
+    | [$release.tag_name, ($arm[0].digest // ""), ($intel[0].digest // "")]
+    | join("|")
+  ')" || return
+
+  [[ -n "$row" && "$row" != *$'\n'* ]] || return 1
+  IFS='|' read -r tag arm_digest intel_digest extra <<< "$row"
+  [[ -z "${extra:-}" ]] || return 1
+  printf '%s\n' "$tag" | grep -Eq '^rust-v[0-9]+([.][0-9]+)+$' || return 1
+  valid_digest "$arm_digest" && valid_digest "$intel_digest" || return 1
+
+  CODEX_TAG="$tag"
+  CODEX_LATEST="${tag#rust-v}"
+  CODEX_ARM_SHA="${arm_digest#sha256:}"
+  CODEX_INTEL_SHA="${intel_digest#sha256:}"
+}
+
+make_temp_root() {
+  if [[ -z "$TEMP_ROOT" ]]; then
+    TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/homebrew-latest-refresh.XXXXXX")"
+  fi
+}
+
+manifest_value() {
+  /usr/bin/plutil -extract "$1" raw -o - "$2"
+}
+
+expect_manifest_value() {
+  local key="$1" expected="$2" manifest="$3" actual
+  actual="$(manifest_value "$key" "$manifest")" || return 1
+  [[ "$actual" == "$expected" ]] || return 1
+}
+
+validate_codex_package() {
+  local target="$1" expected_sha="$2" execute_native="$3"
+  local asset archive package_dir entries manifest actual_sha macho_arch signing_requirement
+  local required executable_path entitlements version_output help_output actual_arch
+  make_temp_root || return 1
+  asset="codex-package-${target}.tar.gz"
+  archive="$TEMP_ROOT/$asset"
+  package_dir="$TEMP_ROOT/$target"
+  entries="$package_dir/archive-entries.txt"
+  manifest="$package_dir/codex-package.json"
+  case "$target" in
+    aarch64-apple-darwin) macho_arch="arm64" ;;
+    x86_64-apple-darwin) macho_arch="x86_64" ;;
+    *) return 1 ;;
+  esac
+  signing_requirement='=anchor apple generic and certificate leaf[subject.OU] = "2DC432GLL2"'
+
+  log "validating $asset"
+  /bin/mkdir -p "$package_dir" || return 1
+  gh release download "$CODEX_TAG" --repo openai/codex --pattern "$asset" --dir "$TEMP_ROOT" || return
+  actual_sha="$(/usr/bin/shasum -a 256 "$archive" | awk '{print $1}')" || return 1
+  [[ "$actual_sha" == "$expected_sha" ]] || {
+    log "Codex package SHA256 does not match the release digest"
+    return 1
+  }
+
+  /usr/bin/tar -tzf "$archive" > "$entries" || return
+  for required in \
+    codex-package.json \
+    bin/codex \
+    bin/codex-code-mode-host \
+    codex-path/rg \
+    codex-resources/zsh/bin/zsh
+  do
+    grep -Fxq "$required" "$entries" || {
+      log "Codex package is missing $required"
+      return 1
+    }
+  done
+
+  /usr/bin/tar -xOzf "$archive" codex-package.json > "$manifest" || return 1
+  expect_manifest_value layoutVersion 1 "$manifest" || return 1
+  expect_manifest_value version "$CODEX_LATEST" "$manifest" || return 1
+  expect_manifest_value target "$target" "$manifest" || return 1
+  expect_manifest_value variant codex "$manifest" || return 1
+  expect_manifest_value entrypoint bin/codex "$manifest" || return 1
+  expect_manifest_value pathDir codex-path "$manifest" || return 1
+  expect_manifest_value resourcesDir codex-resources "$manifest" || return 1
+
+  /usr/bin/tar -xzf "$archive" -C "$package_dir" \
+    bin/codex \
+    bin/codex-code-mode-host \
+    codex-path/rg \
+    codex-resources/zsh/bin/zsh || return 1
+
+  for executable_path in \
+    bin/codex \
+    bin/codex-code-mode-host \
+    codex-path/rg \
+    codex-resources/zsh/bin/zsh
+  do
+    [[ -x "$package_dir/$executable_path" ]] || return 1
+    actual_arch="$(/usr/bin/lipo -archs "$package_dir/$executable_path")" || return 1
+    [[ "$actual_arch" == "$macho_arch" ]] || return 1
+    /usr/bin/codesign --verify --deep --strict \
+      --test-requirement "$signing_requirement" "$package_dir/$executable_path" || return 1
+  done
+
+  for executable_path in codex-path/rg codex-resources/zsh/bin/zsh; do
+    entitlements="$package_dir/$(basename "$executable_path").entitlements"
+    /usr/bin/codesign -d --entitlements - "$package_dir/$executable_path" \
+      > "$entitlements" 2>/dev/null || return 1
+    [[ ! -s "$entitlements" ]] || return 1
+  done
+
+  if (( execute_native )); then
+    version_output="$("$package_dir/bin/codex" --version)" || return 1
+    [[ "$version_output" == "codex-cli $CODEX_LATEST" ]] || return 1
+    help_output="$("$package_dir/bin/codex-code-mode-host" --help 2>&1)" || return 1
+    [[ "$help_output" == *"Usage: codex-code-mode-host"* ]] || return 1
+  fi
+
+  return 0
+}
+
+validate_codex_packages() {
+  local arm_execute=0 intel_execute=0
+  case "$(uname -m)" in
+    arm64) arm_execute=1 ;;
+    x86_64) intel_execute=1 ;;
+    *) log "unsupported native architecture: $(uname -m)"; return 1 ;;
+  esac
+
+  validate_codex_package aarch64-apple-darwin "$CODEX_ARM_SHA" "$arm_execute" ||
+    return 1
+  validate_codex_package x86_64-apple-darwin "$CODEX_INTEL_SHA" "$intel_execute" ||
+    return 1
+}
+
+backup_file() {
+  local source="$1" stem="$2" backup
+  backup="$(mktemp "$CASKS_DIR/.${stem}.backup.XXXXXX")" || return
+  if ! /bin/cp -p "$source" "$backup"; then
+    /bin/rm -f "$backup"
+    return 1
+  fi
+  printf '%s\n' "$backup"
+}
+
+update_version_only() {
+  local file="$1" current="$2" latest="$3" candidate mode
+  candidate="$(mktemp "$CASKS_DIR/.claude-code.rb.XXXXXX")" || return
+  CLAUDE_CANDIDATE="$candidate"
+  awk -v ver="$latest" '
+    /^[[:space:]]*version[[:space:]]+"/ {
+      count++
+      sub(/"[^"]*"/, "\"" ver "\"")
+    }
+    { print }
+    END { if (count != 1) exit 64 }
+  ' "$file" > "$candidate" || return
+  mode="$(stat -f %Lp "$file")" || return 1
+  /bin/chmod "$mode" "$candidate" || return 1
+
+  if /usr/bin/cmp -s "$file" "$candidate"; then
+    return
+  fi
+
+  CLAUDE_BACKUP="$(backup_file "$file" claude-code.rb)" || return
+  RESTORE_PENDING=1
+  /bin/mv -f "$candidate" "$file" || return 1
+  CLAUDE_CANDIDATE=""
+  CLAUDE_CHANGED=1
+  log "claude-code: $current -> $latest"
+}
+
+update_codex_cask() {
+  local candidate mode
+  candidate="$(mktemp "$CASKS_DIR/.codex.rb.XXXXXX")" || return
+  CODEX_CANDIDATE="$candidate"
+  awk -v ver="$CODEX_LATEST" -v arm="$CODEX_ARM_SHA" -v intel="$CODEX_INTEL_SHA" '
+    /^[[:space:]]*version[[:space:]]+"/ {
+      versions++
+      sub(/"[^"]*"/, "\"" ver "\"")
+    }
+    /^[[:space:]]*sha256[[:space:]]+/ {
+      sha_stanzas++
+    }
+    /^[[:space:]]*sha256[[:space:]]+arm:/ {
+      arms++
+      in_sha = 1
+      sub(/"[^"]*"/, "\"" arm "\"")
+    }
+    in_sha && /^[[:space:]]*intel:/ {
+      intels++
+      in_sha = 0
+      sub(/"[^"]*"/, "\"" intel "\"")
+    }
+    /arm64_linux:|x86_64_linux:/ {
+      unsupported++
+    }
+    { print }
+    END {
+      if (versions != 1 || sha_stanzas != 1 || arms != 1 || intels != 1 || unsupported != 0) exit 64
+    }
+  ' "$CODEX_CASK" > "$candidate" || return
+  mode="$(stat -f %Lp "$CODEX_CASK")" || return 1
+  /bin/chmod "$mode" "$candidate" || return 1
+
+  if /usr/bin/cmp -s "$CODEX_CASK" "$candidate"; then
+    return
+  fi
+
+  CODEX_BACKUP="$(backup_file "$CODEX_CASK" codex.rb)" || return
+  RESTORE_PENDING=1
+  /bin/mv -f "$candidate" "$CODEX_CASK" || return 1
+  CODEX_CANDIDATE=""
+  CODEX_CHANGED=1
+  log "codex: $CODEX_CURRENT -> $CODEX_LATEST"
+}
+
+validate_cask_files() {
+  local changed_files=()
+  (( CLAUDE_CHANGED )) && changed_files+=("$CLAUDE_CASK")
+  (( CODEX_CHANGED )) && changed_files+=("$CODEX_CASK")
+  (( ${#changed_files[@]} > 0 )) || return
+
+  git -C "$TAP_DIR" diff --check -- Casks/claude-code.rb Casks/codex.rb
+  HOMEBREW_NO_AUTO_UPDATE=1 brew style "${changed_files[@]}"
+  local file
+  for file in "${changed_files[@]}"; do
+    HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --cask "$file" >/dev/null
+  done
+  if (( CODEX_CHANGED )); then
+    HOMEBREW_NO_AUTO_UPDATE=1 brew audit --cask --strict --online h4rk8s/latest/codex
+  fi
+  HOMEBREW_NO_AUTO_UPDATE=1 brew readall --os all --arch all h4rk8s/latest
+}
+
+discard_backups() {
+  [[ -z "$CLAUDE_BACKUP" || ! -f "$CLAUDE_BACKUP" ]] || /bin/rm -f "$CLAUDE_BACKUP"
+  [[ -z "$CODEX_BACKUP" || ! -f "$CODEX_BACKUP" ]] || /bin/rm -f "$CODEX_BACKUP"
+  CLAUDE_BACKUP=""
+  CODEX_BACKUP=""
+  RESTORE_PENDING=0
+}
+
+acquire_lock
+
+if (( ! CHECK_ONLY )); then
+  require_clean_main
+fi
+
+if validate_codex_cask_contract; then
+  CODEX_CONTRACT_VALID=1
+else
+  log "Codex cask no longer matches the updater's macOS package contract"
+  LOOKUP_FAILED=1
+fi
+
+CLAUDE_CURRENT="$(extract_unique 's/^[[:space:]]*version "([^"]+)".*/\1/p' "$CLAUDE_CASK")"
+printf '%s\n' "$CLAUDE_CURRENT" | grep -Eq '^[0-9]+([.][0-9]+)+$' || {
+  log "Claude Code cask has an invalid current version"
+  exit 1
+}
+if CLAUDE_LATEST="$(npm view @anthropic-ai/claude-code dist-tags.latest 2>/dev/null)" &&
+   printf '%s\n' "$CLAUDE_LATEST" | grep -Eq '^[0-9]+([.][0-9]+)+$'; then
+  if ! CLAUDE_VERSION_ORDER="$(compare_versions "$CLAUDE_LATEST" "$CLAUDE_CURRENT")" ||
+     ! valid_version_order "$CLAUDE_VERSION_ORDER"; then
+    log "unable to compare Claude Code versions"
+    LOOKUP_FAILED=1
+  elif [[ "$CLAUDE_CURRENT" == "$CLAUDE_LATEST" ]]; then
+    log "claude-code: already at $CLAUDE_CURRENT"
+  elif [[ "$CLAUDE_VERSION_ORDER" == "-1" ]]; then
+    log "refusing to downgrade claude-code from $CLAUDE_CURRENT to $CLAUDE_LATEST"
+    LOOKUP_FAILED=1
+  elif (( ! CHECK_ONLY )); then
+    update_version_only "$CLAUDE_CASK" "$CLAUDE_CURRENT" "$CLAUDE_LATEST"
+  else
+    log "claude-code: update available ($CLAUDE_CURRENT -> $CLAUDE_LATEST)"
+    LOOKUP_FAILED=1
+  fi
+else
+  log "unable to resolve a valid Claude Code latest version"
+  CLAUDE_LATEST="$CLAUDE_CURRENT"
+  LOOKUP_FAILED=1
+fi
+
+if (( CODEX_CONTRACT_VALID )); then
+  if fetch_codex_release; then
+    if ! CODEX_VERSION_ORDER="$(compare_versions "$CODEX_LATEST" "$CODEX_CURRENT")" ||
+       ! valid_version_order "$CODEX_VERSION_ORDER"; then
+      log "unable to compare Codex versions"
+      LOOKUP_FAILED=1
+    elif [[ "$CODEX_VERSION_ORDER" == "-1" ]]; then
+      log "refusing to downgrade codex from $CODEX_CURRENT to $CODEX_LATEST"
+      LOOKUP_FAILED=1
+    elif [[ "$CODEX_CURRENT" == "$CODEX_LATEST" &&
+          "$CODEX_CURRENT_ARM_SHA" == "$CODEX_ARM_SHA" &&
+          "$CODEX_CURRENT_INTEL_SHA" == "$CODEX_INTEL_SHA" ]]; then
+      log "codex: already at $CODEX_CURRENT with current release digests"
+      if (( CHECK_ONLY )); then
+        validate_codex_packages || {
+          log "Codex package validation failed"
+          LOOKUP_FAILED=1
+        }
+      fi
+    elif validate_codex_packages; then
+      if (( CHECK_ONLY )); then
+        log "codex: cask metadata differs from $CODEX_LATEST"
+        LOOKUP_FAILED=1
+      else
+        update_codex_cask || {
+          log "unable to update Codex cask atomically"
+          LOOKUP_FAILED=1
+        }
+      fi
+    else
+      log "Codex package validation failed; leaving the cask unchanged"
+      LOOKUP_FAILED=1
+    fi
+  else
+    log "latest Codex release is missing complete macOS package metadata"
+    LOOKUP_FAILED=1
+  fi
+fi
+
+if (( CHECK_ONLY )); then
+  # A repo-local worktree is outside Homebrew's canonical tap path, so RuboCop
+  # otherwise treats this cask as generic Ruby and asks for a frozen-string
+  # comment that canonical casks intentionally omit.
+  HOMEBREW_NO_AUTO_UPDATE=1 brew style --cask \
+    --except-cops Style/FrozenStringLiteralComment "$CODEX_CASK"
+  HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --cask "$CODEX_CASK" >/dev/null
+  (( LOOKUP_FAILED == 0 )) || exit 1
+  log "check passed"
+  exit 0
+fi
+
+if (( CLAUDE_CHANGED || CODEX_CHANGED )); then
+  commit_parts=()
+  validate_cask_files
+
   cd "$TAP_DIR"
-  clear_stale_git_lock "$TAP_DIR"
-  git add Casks/
-  git commit -m "bump: claude-code=$claude_latest codex=$codex_latest"
+  PRE_COMMIT_HEAD="$(git rev-parse HEAD)"
+  FILES_STAGED=1
+  if (( CLAUDE_CHANGED )); then
+    git add -- Casks/claude-code.rb
+    commit_parts+=("claude-code=$CLAUDE_LATEST")
+  fi
+  if (( CODEX_CHANGED )); then
+    git add -- Casks/codex.rb
+    commit_parts+=("codex=$CODEX_LATEST")
+  fi
+  git commit -m "Update ${commit_parts[*]}"
+  FILES_STAGED=0
+  RESTORE_PENDING=0
+  discard_backups
   git_with_retry push origin main
   log "pushed to remote"
-
-  if [[ "$UPGRADE" -eq 1 ]]; then
-    brew upgrade --cask h4rk8s/latest/claude-code 2>/dev/null || true
-    brew upgrade --cask h4rk8s/latest/codex 2>/dev/null || true
-    log "brew upgrade done"
-  else
-    log "skipped local upgrade (pass --upgrade to opt in)"
-  fi
 else
   log "no updates"
 fi
+
+if (( UPGRADE )); then
+  upgrade_failed=0
+  if HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask claude-code >/dev/null 2>&1 &&
+     ! HOMEBREW_NO_AUTO_UPDATE=1 brew upgrade --cask h4rk8s/latest/claude-code; then
+    upgrade_failed=1
+  fi
+  if HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask codex >/dev/null 2>&1 &&
+     ! HOMEBREW_NO_AUTO_UPDATE=1 brew upgrade --cask h4rk8s/latest/codex; then
+    upgrade_failed=1
+  fi
+  if (( upgrade_failed )); then
+    log "one or more local upgrades failed"
+    exit 1
+  fi
+  log "local upgrades completed"
+else
+  log "skipped local upgrade (pass --upgrade to opt in)"
+fi
+
+(( LOOKUP_FAILED == 0 )) || exit 1

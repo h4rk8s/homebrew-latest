@@ -31,7 +31,13 @@ cask "codex" do
     # Preserve the canonical package entrypoint while avoiding stale macOS
     # execution assessments tied to that exact path. A hard link costs no
     # additional package space and remains inside the signed package layout.
-    FileUtils.ln staged_path/"bin/codex", staged_path/"bin/codex-homebrew"
+    source = staged_path/"bin/codex"
+    target = staged_path/"bin/codex-homebrew"
+    if target.symlink? || (target.exist? && !File.identical?(source, target))
+      raise "#{target} exists and is not the managed hard link"
+    end
+
+    File.link source, target unless target.exist?
   end
 
   postflight do

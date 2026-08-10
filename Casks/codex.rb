@@ -21,20 +21,16 @@ cask "codex" do
   binary "bin/codex"
   # Keep the host public for callers that launch it via HOMEBREW_PREFIX/bin.
   binary "bin/codex-code-mode-host"
-  generate_completions_from_executable "bin/codex", "completion"
-
-  preflight do
-    # Completion generation executes Codex before postflight on this tap.
-    system_command "/usr/bin/xattr",
-                   args: ["-dr", "com.apple.quarantine", staged_path.to_s],
-                   sudo: false
-  end
 
   postflight do
     standalone_dir = Pathname("~/.codex/packages/standalone").expand_path
     if standalone_dir.symlink? || (standalone_dir.exist? && !standalone_dir.directory?)
       raise "#{standalone_dir} exists and is not a managed directory"
     end
+
+    system_command "/usr/bin/xattr",
+                   args: ["-dr", "com.apple.quarantine", staged_path.to_s],
+                   sudo: false
 
     standalone_dir.mkpath
 

@@ -2,15 +2,16 @@ cask "claude-code" do
   version "2.1.226"
 
   on_arm do
+    sha256 :no_check
+
     url "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/#{version}/darwin-arm64/claude",
         verified: "storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/"
-    sha256 :no_check
   end
-
   on_intel do
+    sha256 :no_check
+
     url "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/#{version}/darwin-x64/claude",
         verified: "storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/"
-    sha256 :no_check
   end
 
   name "Claude Code"
@@ -26,13 +27,13 @@ cask "claude-code" do
   end
 
   zap trash: [
-    "~/.cache/claude",
-    "~/.claude.json*",
-    "~/.config/claude",
-    "~/.local/bin/claude",
-    "~/.local/share/claude",
-    "~/.local/state/claude",
-    "~/Library/Caches/claude-cli-nodejs",
-  ],
+        "~/.cache/claude",
+        "~/.claude.json*",
+        "~/.config/claude",
+        "~/.local/bin/claude",
+        "~/.local/share/claude",
+        "~/.local/state/claude",
+        "~/Library/Caches/claude-cli-nodejs",
+      ],
       rmdir: "~/.claude"
 end

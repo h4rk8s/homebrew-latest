@@ -1,5 +1,5 @@
 cask "claude-code" do
-  version "2.1.229"
+  version "2.1.231"
 
   on_arm do
     sha256 :no_check
